@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ZooKeeper 使用 logback 记录日志。项目里没有这个配置文件时，logback 会回退到
+  “root=DEBUG + ConsoleAppender” 的默认行为，于是 ZooKeeper 服务端与客户端的 DEBUG
+  日志会刷满控制台的日志面板；而且其中不少日志消息自带换行，会额外产生 `]` 之类的碎片行。
+
+  这里把根日志级别设为 WARN：既能保留真正需要注意的信息，又不会淹没 broker / 控制台的关键事件。
+  需要排查 ZooKeeper 内部细节时，把 root 改成 DEBUG 即可。
+-->
+<configuration>
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <root level="WARN">
+    <appender-ref ref="CONSOLE"/>
+  </root>
+</configuration>

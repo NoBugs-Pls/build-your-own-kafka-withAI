@@ -1,0 +1,17 @@
+# ===== 参考实现：仅本地学习用，不随本仓库上传 =====
+build-your-own-kafka-main/
+
+# ===== 构建产物 =====
+target/
+dependency-reduced-pom.xml
+
+# ===== 运行时数据（消息日志段、稀疏索引、ZooKeeper 快照）=====
+data/
+
+# ===== 编辑器 / 系统文件 =====
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+*Zone.Identifier
