@@ -1,8 +1,10 @@
 package com.simplekafka.broker;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -23,10 +25,17 @@ public class Protocol {
     public static final byte CREATE_TOPIC_RESPONSE = 0x14;
     public static final byte ERROR_RESPONSE = 0x1F;
 
-    // Internal broker communication
-    public static final byte REPLICATE = 0x21;
-    public static final byte REPLICATE_ACK = 0x22;
+    // Broker 间通信
     public static final byte TOPIC_NOTIFICATION = 0x23;
+    /**
+     * 副本拉取（follower → leader）：follower 主动按自己的 LEO 拉数据。
+     *
+     * <p>相比原来的 push 复制（leader 每写一条就推给 follower），pull 有两个关键好处：
+     * ① follower 重启或落后后能自动追上来；② 每个 leader 只用一条连接批量拉，连接数可控。
+     */
+    public static final byte REPLICA_FETCH = 0x26;
+    /** 副本拉取响应：type(1) + logStart(8) + leo(8) + count(4) + 每条[offset(8)+len(4)+payload]。 */
+    public static final byte REPLICA_FETCH_RESPONSE = 0x27;
 
     /**
      * Send an error response to the client
@@ -95,20 +104,144 @@ public class Protocol {
     }
 
     /**
-     * Encode a replication request
+     * Encode a replica fetch request（副本拉取请求）。
+     *
+     * <p>字段长度：type(1) + topicLen(2) + topic(N) + partition(4) + offset(8) + maxBytes(4) + replicaId(4)
      */
-    public static ByteBuffer encodeReplicateRequest(String topic, int partition, long offset, byte[] message) {
-        // 字段长度：type(1) + topicLen(2) + topic(N) + partition(4) + offset(8) + msgLen(4) + msg(M)
-        ByteBuffer buffer = ByteBuffer.allocate(19 + topic.length() + message.length);
-        buffer.put(REPLICATE);
+    public static ByteBuffer encodeReplicaFetchRequest(String topic, int partition, long offset,
+            int maxBytes, int replicaId) {
+        ByteBuffer buffer = ByteBuffer.allocate(23 + topic.length());
+        buffer.put(REPLICA_FETCH);
         buffer.putShort((short) topic.length());
         buffer.put(topic.getBytes());
         buffer.putInt(partition);
         buffer.putLong(offset);
-        buffer.putInt(message.length);
-        buffer.put(message);
+        buffer.putInt(maxBytes);
+        buffer.putInt(replicaId);
         buffer.flip();
         return buffer;
+    }
+
+    /**
+     * Encode a replica fetch response（副本拉取响应，leader 侧使用）。
+     *
+     * @param logStartOffset leader 当前可读的最早 offset（follower 靠它发现自己落后太多）
+     * @param logEndOffset   leader 当前的 LEO
+     * @param startOffset    返回记录里第一条的 offset（后续依次 +1）
+     */
+    public static ByteBuffer encodeReplicaFetchResponse(long logStartOffset, long logEndOffset,
+            long startOffset, List<byte[]> records) {
+        int size = 1 + Long.BYTES * 2 + Integer.BYTES;
+        for (byte[] record : records) {
+            size += Long.BYTES + Integer.BYTES + record.length;
+        }
+        ByteBuffer buffer = ByteBuffer.allocate(size);
+        buffer.put(REPLICA_FETCH_RESPONSE);
+        buffer.putLong(logStartOffset);
+        buffer.putLong(logEndOffset);
+        buffer.putInt(records.size());
+        long offset = startOffset;
+        for (byte[] record : records) {
+            buffer.putLong(offset++);
+            buffer.putInt(record.length);
+            buffer.put(record);
+        }
+        buffer.flip();
+        return buffer;
+    }
+
+    /**
+     * 从 leader 读一次副本拉取响应。
+     *
+     * <p>响应是自描述长度的（先类型，再 logStart/LEO/条数，然后逐条给长度），
+     * 所以按长度精确读取即可，不受固定缓冲区大小限制（拉 1MB 也不会截断）。
+     *
+     * <p>用 {@link InputStream} 而不是 {@code SocketChannel}：前者配合普通 Socket 能真正
+     * 遵守 {@code SO_TIMEOUT}，否则 leader 不响应时拉取线程会永久阻塞。
+     */
+    public static ReplicaFetchResult readReplicaFetchResponse(InputStream in) throws IOException {
+        byte responseType = readFully(in, 1).get();
+
+        if (responseType == ERROR_RESPONSE) {
+            short length = readFully(in, Short.BYTES).getShort();
+            String error = new String(readFully(in, length).array(), StandardCharsets.UTF_8);
+            return new ReplicaFetchResult(-1L, -1L, new byte[0][], error);
+        }
+        if (responseType != REPLICA_FETCH_RESPONSE) {
+            return new ReplicaFetchResult(-1L, -1L, new byte[0][], "unexpected response type: " + responseType);
+        }
+
+        ByteBuffer header = readFully(in, Long.BYTES * 2 + Integer.BYTES);
+        long logStartOffset = header.getLong();
+        long logEndOffset = header.getLong();
+        int count = header.getInt();
+        if (count < 0) {
+            throw new IOException("invalid replica fetch record count: " + count);
+        }
+
+        byte[][] records = new byte[count][];
+        for (int i = 0; i < count; i++) {
+            ByteBuffer metadata = readFully(in, Long.BYTES + Integer.BYTES);
+            metadata.getLong(); // offset 由调用方根据起始 offset 推算
+            int size = metadata.getInt();
+            if (size < 0) {
+                throw new IOException("invalid record size: " + size);
+            }
+            records[i] = readFully(in, size).array();
+        }
+        return new ReplicaFetchResult(logStartOffset, logEndOffset, records, null);
+    }
+
+    /** 从流里精确读满 size 字节；对端提前关闭就报错而不是静默截断。 */
+    private static ByteBuffer readFully(InputStream in, int size) throws IOException {
+        if (size < 0) {
+            throw new IOException("Invalid read size: " + size);
+        }
+        byte[] data = new byte[size];
+        int total = 0;
+        while (total < size) {
+            int read = in.read(data, total, size - total);
+            if (read < 0) {
+                throw new IOException("Connection closed while reading replica fetch response");
+            }
+            total += read;
+        }
+        return ByteBuffer.wrap(data);
+    }
+
+    /** 副本拉取结果：leader 的起点/LEO + 一批记录。 */
+    public static final class ReplicaFetchResult {
+        private final long logStartOffset;
+        private final long logEndOffset;
+        private final byte[][] records;
+        private final String error;
+
+        private ReplicaFetchResult(long logStartOffset, long logEndOffset, byte[][] records, String error) {
+            this.logStartOffset = logStartOffset;
+            this.logEndOffset = logEndOffset;
+            this.records = records;
+            this.error = error;
+        }
+
+        public boolean isSuccess() {
+            return error == null;
+        }
+
+        public long getLogStartOffset() {
+            return logStartOffset;
+        }
+
+        public long getLogEndOffset() {
+            return logEndOffset;
+        }
+
+        public byte[][] getRecords() {
+            return records;
+        }
+
+        public String getError() {
+            return error;
+        }
     }
 
     /**

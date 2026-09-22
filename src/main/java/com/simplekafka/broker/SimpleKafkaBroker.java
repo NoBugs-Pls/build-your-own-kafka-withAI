@@ -3,6 +3,7 @@ package com.simplekafka.broker;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
@@ -11,6 +12,7 @@ import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -44,6 +46,12 @@ public class SimpleKafkaBroker {
      * {@code /brokers} 里；没有这个宽限期，一重启就会把在线副本当成死节点剔除。
      */
     private static final long BROKER_ABSENCE_GRACE_MS = 15_000L;
+    /** 一次副本拉取最多返回的字节数。 */
+    private static final int REPLICA_FETCH_MAX_BYTES = 256 * 1024;
+    /** 副本拉取的空闲轮询间隔（毫秒）；拉到数据时立刻继续下一轮，以便尽快追赶。 */
+    private static final long REPLICA_FETCH_INTERVAL_MS = 100L;
+    /** 已追平时 leader 侧的最长等待（长轮询）：既降空轮询频率，新数据到达时又能立刻返回。 */
+    private static final long REPLICA_FETCH_MAX_WAIT_MS = 200L;
 
     private final int brokerId;
     private final String brokerHost;
@@ -60,6 +68,11 @@ public class SimpleKafkaBroker {
     private final long startTimeMs;
     private final ZookeeperClient zkClient;
     private Thread registrationKeeper;
+    private Thread replicaFetcher;
+    /** 到各 leader 的副本拉取长连接（key = leader id）；断了就丢掉，下一轮重连。 */
+    private final Map<Integer, Socket> replicaConnections;
+    /** 已经报过故障的 leader（避免 leader 长时间不可达时每秒刷日志）。 */
+    private final java.util.Set<Integer> reportedLeaderFailures;
 
     public SimpleKafkaBroker(int brokerId, String host, int port, int zkPort) throws IOException {
         this.brokerId = brokerId;
@@ -77,6 +90,8 @@ public class SimpleKafkaBroker {
         this.clusterMetadata = new ConcurrentHashMap<>();
         this.brokerLastSeen = new ConcurrentHashMap<>();
         this.startTimeMs = System.currentTimeMillis();
+        this.replicaConnections = new ConcurrentHashMap<>();
+        this.reportedLeaderFailures = ConcurrentHashMap.newKeySet();
 
         // Initialize data directory
         File dataDir = new File(DATA_DIR + File.separator + brokerId);
@@ -168,6 +183,7 @@ public class SimpleKafkaBroker {
 
         List<String> partitionIds = zkClient.getChildren(topicPath + "/partitions");
         List<Partition> partitions = topics.get(topic);
+        boolean changed = partitions == null || partitions.isEmpty();
         if (partitions == null) {
             partitions = new CopyOnWriteArrayList<>();
             topics.put(topic, partitions);
@@ -196,12 +212,14 @@ public class SimpleKafkaBroker {
                 String partitionDir = topicDir + File.separator + id;
                 new File(partitionDir).mkdirs();
                 partitions.add(new Partition(id, leader, followers, partitionDir));
+                changed = true;
                 LOGGER.info("Loaded partition " + id + " for topic " + topic +
                         ", leader: " + leader + ", followers: " + followers);
             } else if (existing.getLeader() != leader
                     || !new HashSet<>(existing.getFollowers()).equals(new HashSet<>(followers))) {
                 existing.setLeader(leader);
                 existing.setFollowers(followers);
+                changed = true;
                 LOGGER.info("Refreshed partition " + id + " of topic " + topic +
                         ": leader=" + leader + ", followers=" + followers);
             }
@@ -212,10 +230,17 @@ public class SimpleKafkaBroker {
             if (!partitionIds.contains(String.valueOf(partition.getId()))) {
                 partition.close();
                 partitions.remove(partition);
+                changed = true;
             }
         }
 
-        LOGGER.info("Topic " + topic + " ready with " + partitions.size() + " partitions");
+        // 每 5 秒的周期刷新不应刷屏：只有真的发生变化时才打 INFO
+        if (changed) {
+            LOGGER.info("Topic " + topic + " ready with " + partitions.size() + " partitions");
+        } else {
+            LOGGER.log(Level.FINE, "Topic {0} unchanged ({1} partitions)",
+                    new Object[] {topic, partitions.size()});
+        }
     }
 
     /**
@@ -350,6 +375,9 @@ public class SimpleKafkaBroker {
             // be removed from the dashboard. Without this, the broker stays invisible.
             startRegistrationKeeper();
 
+            // 以 follower 身份主动从各分区 leader 拉数据（pull 复制）：落后或重启后能自动追赶
+            startReplicaFetcher();
+
             // Accept client connections
             executor.submit(this::acceptConnections);
         }
@@ -366,6 +394,10 @@ public class SimpleKafkaBroker {
                 if (registrationKeeper != null) {
                     registrationKeeper.interrupt();
                 }
+                if (replicaFetcher != null) {
+                    replicaFetcher.interrupt();
+                }
+                closeAllReplicaConnections();
 
                 // Close server socket
                 serverChannel.close();
@@ -471,8 +503,26 @@ public class SimpleKafkaBroker {
                         zkClient.createEphemeralNode(brokerPath, brokerHost + ":" + brokerPort);
                         LOGGER.warning("Re-registered broker " + brokerId + " with ZooKeeper at " + brokerPath);
                     }
+                    // 周期执行保留策略清理：时间维度的过期需要定时触发（字节维度在写入时已检查）
+                    for (List<Partition> partitions : topics.values()) {
+                        for (Partition partition : partitions) {
+                            partition.cleanup();
+                        }
+                    }
                     // 周期刷新分区元数据：controller 重新分配 leader/follower 后，本 broker 能自动跟上
                     refreshTopicsFromZookeeper();
+                    // 刷新“最后确认在线”的时间戳：
+                    // 只在 /brokers 变化事件里记时间是不够的 —— 控制台重连前会删掉残留注册节点，
+                    // 那一下会让长时间没刷新的旧时间戳显得"已经缺席很久"，从而把一个
+                    // 刚刚重启中的副本误判为确认下线（宽限期失效）。
+                    long now = System.currentTimeMillis();
+                    for (String id : zkClient.getChildren("/brokers")) {
+                        try {
+                            brokerLastSeen.put(Integer.parseInt(id), now);
+                        } catch (NumberFormatException ignored) {
+                            // 非数字子节点直接忽略
+                        }
+                    }
                     if (!zkClient.exists("/controller")) {
                         electController();
                     }
@@ -681,7 +731,6 @@ public class SimpleKafkaBroker {
             return;
         }
 
-        LOGGER.info("Rebalancing partitions across cluster");
         try {
             // 以 ZooKeeper 的实时注册为准；读不到时退回本地缓存
             List<Integer> liveBrokers = new ArrayList<>();
@@ -701,6 +750,7 @@ public class SimpleKafkaBroker {
             }
 
             long now = System.currentTimeMillis();
+            int reassignedCount = 0;
             for (String topic : zkClient.getChildren("/topics")) {
                 String partitionsPath = "/topics/" + topic + "/partitions";
                 if (!zkClient.exists(partitionsPath)) continue;
@@ -763,10 +813,18 @@ public class SimpleKafkaBroker {
                         data.append(reassigned.get(i)).append(',');
                     }
                     zkClient.setData(node, data.toString());
+                    reassignedCount++;
                     LOGGER.info("Reassigned " + topic + "-" + partitionId
                             + " (was " + replicas + ") → " + reassigned);
                 }
                 loadTopic(topic);
+            }
+
+            // 每 5 秒的周期检查不应刷屏：只有真的动了分配才打 INFO
+            if (reassignedCount > 0) {
+                LOGGER.info("Rebalance finished: " + reassignedCount + " partition(s) reassigned");
+            } else {
+                LOGGER.log(Level.FINE, "Rebalance check: all replicas healthy");
             }
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Rebalance failed", e);
@@ -825,13 +883,14 @@ public class SimpleKafkaBroker {
                 SocketChannel clientChannel = serverChannel.accept();
                 if (clientChannel != null) {
                     clientChannel.configureBlocking(false);
-                    LOGGER.info("Accepted connection from " + clientChannel.getRemoteAddress());
+                    // 副本拉取会频繁建连，连接建立日志放到 FINE，避免刷满日志面板
+                    LOGGER.log(Level.FINE, "Accepted connection from {0}", clientChannel.getRemoteAddress());
 
                     // Handle client connection in a separate thread
                     executor.submit(() -> handleClient(clientChannel));
                 }
 
-                Thread.sleep(100); // Small pause to prevent CPU spin
+                Thread.sleep(1); // 非阻塞 accept，几乎无需等待；睡太久会把新建连接限成 ~10/s
             } catch (Exception e) {
                 if (isRunning.get()) {
                     LOGGER.log(Level.SEVERE, "Error accepting connection", e);
@@ -861,7 +920,7 @@ public class SimpleKafkaBroker {
                     break;
                 }
 
-                Thread.sleep(50); // Small pause to prevent CPU spin
+                Thread.sleep(1); // 非阻塞读，让出 CPU 即可；睡太久会拖慢同一连接上的后续请求
             }
         } catch (Exception e) {
             if (isRunning.get()) {
@@ -897,8 +956,8 @@ public class SimpleKafkaBroker {
             case Protocol.CREATE_TOPIC:
                 handleCreateTopicRequest(clientChannel, buffer);
                 break;
-            case Protocol.REPLICATE:
-                handleReplicateRequest(clientChannel, buffer);
+            case Protocol.REPLICA_FETCH:
+                handleReplicaFetchRequest(clientChannel, buffer);
                 break;
             case Protocol.TOPIC_NOTIFICATION:
                 handleTopicNotification(clientChannel, buffer);
@@ -941,11 +1000,11 @@ public class SimpleKafkaBroker {
             return;
         }
 
-        // Append message to log
+        // Append message to log（offset 由 leader 单点分配）
         long offset = targetPartition.append(message);
 
-        // Replicate to followers
-        replicateToFollowers(topic, targetPartition, message, offset);
+        // 复制不再由 leader 推送：follower 会按自己的 LEO 主动来拉（见 fetchFromLeaders）。
+        // 好处：follower 重启/落后后能自动追赶，也不需要“每条消息一个连接”。
 
         // Send acknowledgment to client
         ByteBuffer response = ByteBuffer.allocate(10);
@@ -997,64 +1056,177 @@ public class SimpleKafkaBroker {
         }
     }
 
+    // ==================================================================
+    // 复制：follower 主动拉取（pull replication）
+    // ==================================================================
+
     /**
-     * Replicate message to follower brokers
+     * 启动副本拉取线程。
+     *
+     * <p>为什么用 pull 而不是 push：push 只能覆盖「leader 写一条就推一条」的实时路径，
+     * follower 一旦重启或落后就永远补不回来。pull 让 follower 按自己的 LEO 主动要数据，
+     * 天生支持追赶，也把连接数从「每条消息一个连接」降到「每个 leader 一个连接」。
      */
-    private void replicateToFollowers(String topic, Partition partition, byte[] message, long offset) {
-        List<Integer> followers = partition.getFollowers();
-        LOGGER.info("Replicating " + topic + "-" + partition.getId() + " offset=" + offset
-                + " to followers=" + followers + " knownBrokers=" + clusterMetadata.keySet());
+    private void startReplicaFetcher() {
+        replicaFetcher = new Thread(() -> {
+            while (isRunning.get()) {
+                long fetched = 0L;
+                try {
+                    fetched = fetchFromLeaders();
+                } catch (Exception e) {
+                    // 拉取失败（leader 暂时不可达等）不改状态，等下一轮重试
+                    LOGGER.log(Level.FINE, "Replica fetch round failed", e);
+                }
+                try {
+                    Thread.sleep(fetched > 0 ? 10L : REPLICA_FETCH_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }, "replica-fetcher-" + brokerId);
+        replicaFetcher.setDaemon(true);
+        replicaFetcher.start();
+    }
 
-        for (int followerId : followers) {
-            if (followerId == brokerId)
-                continue; // Skip self
+    /**
+     * 一轮拉取：把「我是 follower」的分区按 leader 分组，每个 leader 复用一条连接依次拉取。
+     *
+     * @return 本轮共追上的记录数（>0 说明还在追赶，下一轮几乎立即开始）
+     */
+    private long fetchFromLeaders() {
+        Map<Integer, List<String[]>> byLeader = new HashMap<>();
+        for (Map.Entry<String, List<Partition>> entry : topics.entrySet()) {
+            String topic = entry.getKey();
+            for (Partition partition : entry.getValue()) {
+                int leaderId = partition.getLeader();
+                if (leaderId == brokerId || !partition.getFollowers().contains(brokerId)) {
+                    continue; // 我是 leader，或我根本不是这个分区的副本
+                }
+                byLeader.computeIfAbsent(leaderId, ignored -> new ArrayList<>())
+                        .add(new String[] {topic, String.valueOf(partition.getId())});
+            }
+        }
 
-            BrokerInfo follower = clusterMetadata.get(followerId);
-            if (follower == null) {
-                LOGGER.warning("Skip replication to unknown broker " + followerId);
+        // 先回收不再需要的连接（leader 变更之后）
+        for (Integer leaderId : new ArrayList<>(replicaConnections.keySet())) {
+            if (!byLeader.containsKey(leaderId)) {
+                closeReplicaConnection(leaderId);
+            }
+        }
+
+        long totalFetched = 0L;
+        for (Map.Entry<Integer, List<String[]>> entry : byLeader.entrySet()) {
+            int leaderId = entry.getKey();
+            BrokerInfo leader = clusterMetadata.get(leaderId);
+            if (leader == null) {
+                closeReplicaConnection(leaderId);
                 continue;
             }
-
-            executor.submit(() -> {
-                try (SocketChannel followerChannel = SocketChannel.open()) {
-                    followerChannel.connect(new InetSocketAddress(follower.getHost(), follower.getPort()));
-
-                    // Prepare replication request
-                    // 字段长度：type(1) + topicLen(2) + topic(N) + partition(4) + offset(8) + msgLen(4) + msg(M)
-                    ByteBuffer request = ByteBuffer.allocate(19 + topic.length() + message.length);
-                    request.put(Protocol.REPLICATE);
-                    request.putShort((short) topic.length());
-                    request.put(topic.getBytes());
-                    request.putInt(partition.getId());
-                    request.putLong(offset);
-                    request.putInt(message.length);
-                    request.put(message);
-                    request.flip();
-
-                    // Send request to follower
-                    followerChannel.write(request);
-
-                    // Read acknowledgment
-                    ByteBuffer response = ByteBuffer.allocate(1);
-                    followerChannel.read(response);
-                    response.flip();
-
-                    byte ack = response.get();
-                    LOGGER.info("Replication to follower " + followerId + " " +
-                            (ack == Protocol.REPLICATE_ACK ? "succeeded" : "failed"));
-                } catch (Exception e) {
-                    // 必须捕获 Exception 而不只是 IOException：解析类的 RuntimeException 以前会被
-                    // 线程池静默吞掉，导致复制失败却没有任何日志（这正是一次真实故障的成因）。
-                    LOGGER.log(Level.SEVERE, "Replication to follower " + followerId + " failed: " + e, e);
+            try {
+                // 每个 leader 复用一条长连接：避免每轮都建连（连接数从 #leader×N 降到 #leader）
+                Socket socket = replicaConnection(leaderId, leader);
+                OutputStream out = socket.getOutputStream();
+                for (String[] ref : entry.getValue()) {
+                    totalFetched += fetchPartitionFromLeader(socket, out, ref[0], Integer.parseInt(ref[1]));
                 }
-            });
+                reportedLeaderFailures.remove(leaderId);
+            } catch (Exception e) {
+                // 同一个故障只报一次，后续降到 FINE，避免 leader 长时间不可达时刷日志
+                if (reportedLeaderFailures.add(leaderId)) {
+                    LOGGER.warning("Replica fetch from leader " + leaderId + " failed, will retry: " + e);
+                } else {
+                    LOGGER.log(Level.FINE, "Replica fetch from leader " + leaderId + " failed", e);
+                }
+                closeReplicaConnection(leaderId); // 连接可能已损坏，下一轮重连
+            }
+        }
+        return totalFetched;
+    }
+
+    /** 取得（必要时建立）到某个 leader 的副本拉取连接。 */
+    private Socket replicaConnection(int leaderId, BrokerInfo leader) throws IOException {
+        Socket existing = replicaConnections.get(leaderId);
+        if (existing != null && existing.isConnected() && !existing.isClosed()) {
+            return existing;
+        }
+        Socket socket = new Socket();
+        socket.connect(new InetSocketAddress(leader.getHost(), leader.getPort()), CONTROL_CONNECT_TIMEOUT_MS);
+        socket.setSoTimeout(CONTROL_READ_TIMEOUT_MS);
+        socket.setTcpNoDelay(true);
+        replicaConnections.put(leaderId, socket);
+        LOGGER.info("Opened replica fetch connection to leader " + leaderId + " ("
+                + leader.getHost() + ":" + leader.getPort() + ")");
+        return socket;
+    }
+
+    private void closeReplicaConnection(int leaderId) {
+        Socket socket = replicaConnections.remove(leaderId);
+        if (socket != null) {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // 关闭失败无需处理
+            }
+        }
+    }
+
+    private void closeAllReplicaConnections() {
+        for (Integer leaderId : new ArrayList<>(replicaConnections.keySet())) {
+            closeReplicaConnection(leaderId);
         }
     }
 
     /**
-     * Handle replication request from leader
+     * 从 leader 拉一次某个分区，并按 leader 的 offset 落盘。
+     *
+     * @param out 与同一个 leader 的共享输出流（多个分区复用一条连接）
      */
-    private void handleReplicateRequest(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
+    private long fetchPartitionFromLeader(Socket socket, OutputStream out, String topic, int partitionId)
+            throws IOException {
+        Partition partition = findPartition(topics.get(topic), partitionId);
+        if (partition == null) {
+            return 0L;
+        }
+
+        long fetchOffset = partition.getLogEndOffset();
+        ByteBuffer request = Protocol.encodeReplicaFetchRequest(topic, partitionId, fetchOffset,
+                REPLICA_FETCH_MAX_BYTES, brokerId);
+        out.write(request.array(), 0, request.limit());
+        out.flush();
+
+        Protocol.ReplicaFetchResult result = Protocol.readReplicaFetchResponse(socket.getInputStream());
+        if (!result.isSuccess()) {
+            LOGGER.warning("Replica fetch " + topic + "-" + partitionId + " rejected: " + result.getError());
+            return 0L;
+        }
+
+        // leader 的起点超过我的 LEO ⇒ 它按保留策略删掉了我还没读到的数据，先把起点对齐
+        if (result.getLogStartOffset() > fetchOffset) {
+            partition.truncateBefore(result.getLogStartOffset());
+            fetchOffset = partition.getLogEndOffset();
+        }
+
+        byte[][] records = result.getRecords();
+        long offset = fetchOffset;
+        for (byte[] record : records) {
+            partition.appendAtOffset(offset++, record);
+        }
+        if (records.length > 0) {
+            LOGGER.info("Replica fetch " + topic + "-" + partitionId + " appended " + records.length
+                    + " record(s), LEO now " + partition.getLogEndOffset()
+                    + " (leader LEO " + result.getLogEndOffset() + ")");
+        }
+        return records.length;
+    }
+
+    /**
+     * 处理副本拉取请求（leader 侧）。
+     *
+     * <p>总是把 {@code logStartOffset} 与 {@code LEO} 一并回给 follower：
+     * 前者让 follower 发现「自己落后到数据已被删除」，后者让它知道是否已追上。
+     */
+    private void handleReplicaFetchRequest(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
         short topicLength = buffer.getShort();
         byte[] topicBytes = new byte[topicLength];
         buffer.get(topicBytes);
@@ -1062,32 +1234,48 @@ public class SimpleKafkaBroker {
 
         int partitionId = buffer.getInt();
         long offset = buffer.getLong();
-        int messageSize = buffer.getInt();
-        byte[] message = new byte[messageSize];
-        buffer.get(message);
+        int maxBytes = buffer.getInt();
+        int replicaId = buffer.getInt();
 
-        LOGGER.info("Replication request for topic: " + topic + ", partition: " + partitionId + ", offset: " + offset);
-
-        // 取出分区；必要时先从 ZooKeeper 刷新
         Partition targetPartition;
         try {
             targetPartition = requirePartition(topic, partitionId);
         } catch (Exception e) {
-            ByteBuffer response = ByteBuffer.allocate(1);
-            response.put((byte) 0); // Failed
-            response.flip();
-            clientChannel.write(response);
+            Protocol.sendErrorResponse(clientChannel,
+                    e.getMessage() == null ? "Partition does not exist" : e.getMessage());
             return;
         }
 
-        // Append message to log (as follower)，按 leader 分配的 offset 写入，保证副本之间 offset 对齐
-        targetPartition.appendAtOffset(offset, message);
+        long logStart = targetPartition.getLogStartOffset();
+        long leo = targetPartition.getLogEndOffset();
 
-        // Send acknowledgment
-        ByteBuffer response = ByteBuffer.allocate(1);
-        response.put(Protocol.REPLICATE_ACK);
-        response.flip();
-        clientChannel.write(response);
+        // 长轮询：follower 已追平时不立刻回空，而是等一小会儿——
+        // 既能把空轮询频率降下来，新数据到达时又能立刻返回（延迟更低）。
+        long deadline = System.currentTimeMillis() + REPLICA_FETCH_MAX_WAIT_MS;
+        while (offset == leo && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(20L);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            leo = targetPartition.getLogEndOffset();
+            logStart = targetPartition.getLogStartOffset();
+        }
+
+        List<byte[]> records;
+        if (offset < logStart || offset >= leo) {
+            // 起点越界：回空列表 + 真实的 logStart/LEO，由 follower 自己决定怎么对齐
+            records = Collections.emptyList();
+            if (offset < logStart) {
+                // 只在真正“落后到数据已被删除”时告警，避免已追平时的空轮询刷日志
+                LOGGER.warning("Replica fetch from broker " + replicaId + " for " + topic + "-" + partitionId
+                        + " at offset " + offset + " is behind log start " + logStart + "; follower will realign");
+            }
+        } else {
+            records = targetPartition.readMessages(offset, maxBytes);
+        }
+        writeFully(clientChannel, Protocol.encodeReplicaFetchResponse(logStart, leo, offset, records));
     }
 
     /**
@@ -1116,6 +1304,13 @@ public class SimpleKafkaBroker {
         }
 
         // Check if the offset is valid
+        if (offset < targetPartition.getLogStartOffset()) {
+            // 老数据已被保留策略删除：明确报错，绝不能把幸存的新数据错位标注成被请求的 offset
+            Protocol.sendErrorResponse(clientChannel, "OffsetOutOfRange: offset " + offset
+                    + " is before log start offset " + targetPartition.getLogStartOffset()
+                    + " of " + topic + "-" + partition);
+            return;
+        }
         if (offset >= targetPartition.getLogEndOffset()) {
             // No messages available at this offset
             ByteBuffer response = ByteBuffer.allocate(5);
@@ -1407,6 +1602,9 @@ public class SimpleKafkaBroker {
             if (brokerIds.isEmpty()) {
                 brokerIds.addAll(clusterMetadata.keySet());
             }
+            // 必须排序：ZooKeeper 不保证 getChildren 的顺序，不排序会让“同样的集群与参数”
+            // 每次创建出不同的 leader 分配，既不可复现也与文档描述不符。
+            Collections.sort(brokerIds);
             LOGGER.info("Creating topic " + topic + " over live brokers " + brokerIds);
 
             for (int i = 0; i < numPartitions; i++) {

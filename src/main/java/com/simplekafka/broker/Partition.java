@@ -39,8 +39,12 @@ import java.util.logging.Logger;
 public class Partition {
     private static final Logger LOGGER = Logger.getLogger(Partition.class.getName());
 
-    /** 单段最大字节数。真实 Kafka 默认 1GB，这里用 1MB 便于观察多段行为。 */
-    public static final long MAX_SEGMENT_BYTES = 1024 * 1024L;
+    /** 单段最大字节数（可用 -Dsimplekafka.segment.bytes 覆盖）。真实 Kafka 默认 1GB，这里 1MB 便于观察多段行为。 */
+    public static final long MAX_SEGMENT_BYTES = Long.getLong("simplekafka.segment.bytes", 1024 * 1024L);
+    /** 单个分区保留上限（字节，-Dsimplekafka.retention.bytes 可覆盖）；≤ 0 表示不限制。 */
+    public static final long RETENTION_BYTES = Long.getLong("simplekafka.retention.bytes", 8 * 1024 * 1024L);
+    /** 段保留时长（毫秒，-Dsimplekafka.retention.ms 可覆盖）；≤ 0 表示不限制。 */
+    public static final long RETENTION_MS = Long.getLong("simplekafka.retention.ms", 3600_000L);
     /** 稀疏索引条目大小：[4B 相对 offset][4B 相对 position]。 */
     private static final int INDEX_ENTRY_BYTES = 8;
     /** 索引稀疏间隔（字节），对齐 Kafka 的 log.index.interval.bytes 默认值。 */
@@ -56,6 +60,8 @@ public class Partition {
     private List<Integer> followers;
     private final String baseDir;
     private final AtomicLong nextOffset;
+    /** 分区里最早一条可用消息的 offset（保留策略删掉旧段后会前移）。 */
+    private volatile long logStartOffset;
     private final ReadWriteLock lock;
     private final List<SegmentInfo> segments;
 
@@ -122,15 +128,17 @@ public class Partition {
             if (segments.isEmpty()) {
                 createNewSegment(0L);
                 nextOffset.set(0L);
+                logStartOffset = 0L;
             } else {
                 openSegmentForAppend(segments.get(segments.size() - 1));
+                logStartOffset = segments.get(0).baseOffset;
             }
         } catch (IOException e) {
             throw new IllegalStateException("Failed to open active segment for partition " + id, e);
         }
 
         LOGGER.info("Initialized partition " + id + " with " + segments.size()
-                + " segments, next offset: " + nextOffset.get());
+                + " segments, log start: " + logStartOffset + ", next offset: " + nextOffset.get());
     }
 
     /**
@@ -306,6 +314,134 @@ public class Partition {
         segment.lastIndexPosition = position;
     }
 
+    // ==================================================================
+    // 保留策略（log retention）：删除过旧的段
+    // ==================================================================
+
+    /**
+     * 按保留策略删除过旧的段（对应 Kafka 的 log.retention.*）。
+     *
+     * <p>规则：
+     * <ul>
+     *   <li>绝不删除活跃段，也绝不让分区变成零个段；</li>
+     *   <li>最旧的段“太旧”（文件最后修改时间超过 {@link #RETENTION_MS}）
+     *       或“太大”（总字节数超过 {@link #RETENTION_BYTES}）时，从最旧的段开始删。</li>
+     * </ul>
+     *
+     * <p>删除后 {@link #getLogStartOffset()} 会前移：消费者再去读已经被删掉的 offset 会得到
+     * “offset 越界”错误，而不会拿到被错位标注的新数据。
+     *
+     * @return 本次删除的段数
+     */
+    public int cleanup() {
+        lock.writeLock().lock();
+        try {
+            int deleted = 0;
+            long total = totalSizeLocked();
+            while (segments.size() > 1) {
+                SegmentInfo oldest = segments.get(0);
+                if (oldest == activeSegment) {
+                    break;
+                }
+                boolean tooOld = RETENTION_MS > 0
+                        && System.currentTimeMillis() - oldest.logFile.lastModified() > RETENTION_MS;
+                boolean tooBig = RETENTION_BYTES > 0 && total > RETENTION_BYTES;
+                if (!tooOld && !tooBig) {
+                    break;
+                }
+                deleteSegment(oldest);
+                total -= oldest.size;
+                deleted++;
+            }
+            if (deleted > 0) {
+                logStartOffset = segments.get(0).baseOffset;
+                LOGGER.info("Retention deleted " + deleted + " segment(s) of partition " + id
+                        + ", log start offset is now " + logStartOffset + ", remaining bytes " + total);
+            }
+            return deleted;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * 丢弃 offset 之前的全部数据，把分区起点对齐到该 offset。
+     *
+     * <p>专用于 follower 追赶：leader 按保留策略删掉了 follower 还没读到的老段时，
+     * follower 的 LEO 会小于 leader 的 logStartOffset，唯一正确的做法是丢掉自己超出
+     * 范围的老数据、把起点对齐到 leader（Kafka 里对应 follower 的日志截断）。
+     *
+     * <p>如果目标起点已经超过本分区 LEO，则整个分区被清空，并以该 offset 作为新起点。
+     */
+    public void truncateBefore(long newStartOffset) {
+        lock.writeLock().lock();
+        try {
+            if (newStartOffset <= logStartOffset) {
+                return;
+            }
+            if (newStartOffset >= nextOffset.get()) {
+                // 完全落后于 leader 的保留起点：清空并重定起点
+                closeActiveChannel();
+                for (SegmentInfo segment : new ArrayList<>(segments)) {
+                    deleteSegment(segment);
+                }
+                segments.clear();
+                activeSegment = null;
+                createNewSegment(newStartOffset);
+                nextOffset.set(newStartOffset);
+                logStartOffset = newStartOffset;
+                LOGGER.warning("Partition " + id + " was entirely behind leader retention; reset to offset "
+                        + newStartOffset);
+                return;
+            }
+
+            int deleted = 0;
+            while (segments.size() > 1) {
+                SegmentInfo oldest = segments.get(0);
+                if (oldest == activeSegment) {
+                    break;
+                }
+                if (segments.get(1).baseOffset > newStartOffset) {
+                    break; // 该段里已经包含 >= newStartOffset 的数据，不能再删
+                }
+                deleteSegment(oldest);
+                deleted++;
+            }
+            long previous = logStartOffset;
+            logStartOffset = segments.get(0).baseOffset;
+            if (deleted > 0) {
+                LOGGER.warning("Truncated partition " + id + ": log start " + previous + " → " + logStartOffset
+                        + " to catch up with leader");
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to truncate partition " + id + " to " + newStartOffset, e);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** 删除一个段（日志文件 + 索引文件）。调用方必须持有写锁。 */
+    private void deleteSegment(SegmentInfo segment) {
+        segments.remove(segment);
+        if (!segment.logFile.delete()) {
+            LOGGER.warning("Failed to delete log segment " + segment.logFile.getAbsolutePath());
+        }
+        if (segment.indexFile.exists() && !segment.indexFile.delete()) {
+            LOGGER.warning("Failed to delete index file " + segment.indexFile.getAbsolutePath());
+        }
+        LOGGER.info("Deleted segment " + segment.logFile.getName() + " of partition " + id
+                + " (" + segment.size + " bytes)");
+    }
+
+    /** 日志总字节数（不含索引）。调用方必须持有读锁或写锁。 */
+    private long totalSizeLocked() {
+        long total = 0L;
+        for (SegmentInfo segment : segments) {
+            total += segment.size;
+        }
+        return total;
+    }
+
     private void ensureActiveSegment() throws IOException {
         if (activeSegment != null && activeLogChannel != null) {
             return;
@@ -376,6 +512,11 @@ public class Partition {
     public List<byte[]> readMessages(long offset, int maxBytes) {
         if (offset < 0) {
             throw new IllegalArgumentException("offset must not be negative");
+        }
+        if (offset < logStartOffset) {
+            // 老数据已被保留策略删除：绝不能把幸存的新数据错位标注成被请求的 offset
+            throw new IllegalArgumentException("offset " + offset
+                    + " is before log start offset " + logStartOffset + " (deleted by retention)");
         }
         if (maxBytes <= 0) {
             return Collections.emptyList();
@@ -548,6 +689,31 @@ public class Partition {
     /** 下一条待写入消息的 offset（log end offset / LEO）。 */
     public long getLogEndOffset() {
         return nextOffset.get();
+    }
+
+    /** 仍然可读的最早 offset（log start offset）；小于它的 offset 已被保留策略删除。 */
+    public long getLogStartOffset() {
+        return logStartOffset;
+    }
+
+    /** 分区当前占用的日志字节数（不含索引）。 */
+    public long getTotalSize() {
+        lock.readLock().lock();
+        try {
+            return totalSizeLocked();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /** 当前段数量。 */
+    public int getSegmentCount() {
+        lock.readLock().lock();
+        try {
+            return segments.size();
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     /** 关闭活跃段释放句柄。 */

@@ -676,6 +676,7 @@ public final class DashboardServer {
       log("Produced topic=" + topic + " partition=" + partition + " offset=" + offset);
       sendJson(exchange, 200, "{\"ok\":true,\"offset\":" + offset + "}");
     } catch (Exception e) {
+      log("Produce failed topic=" + topic + " partition=" + partition + ": " + message(e));
       sendJson(exchange, 400, "{\"ok\":false,\"error\":" + quote(message(e)) + "}");
     }
   }
@@ -699,6 +700,7 @@ public final class DashboardServer {
       }
       sendJson(exchange, 200, json.append("]}").toString());
     } catch (Exception e) {
+      log("Fetch failed topic=" + topic + " partition=" + partition + " offset=" + offset + ": " + message(e));
       sendJson(exchange, 400, "{\"ok\":false,\"error\":" + quote(message(e)) + "}");
     }
   }

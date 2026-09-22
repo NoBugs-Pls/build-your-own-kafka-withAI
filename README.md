@@ -33,6 +33,7 @@
    - 4.8 [什么时候重新分配副本（replace / rebalance）](#48-什么时候重新分配副本replace--rebalance)
    - 4.9 [持久化：消息怎么落盘](#49-持久化消息怎么落盘)
    - 4.10 [重启后：持久化的数据怎么读回来](#410-重启后持久化的数据怎么读回来)
+   - 4.11 [保留策略：老数据怎么被删掉](#411-保留策略老数据怎么被删掉)
 5. [边缘问题：现象 → 原因 → 处理](#5-边缘问题现象--原因--处理)
 6. [线协议：实现、差异与优化](#6-线协议实现差异与优化)
    - 6.1 [三层实现](#61-三层实现)
@@ -308,20 +309,33 @@ sequenceDiagram
 **要点**：offset 由 leader 单点分配，因此同一分区不会出现 offset 冲突；
 客户端拿到的 offset 一定是最新的 `log end offset - 1`。
 
-### 4.6 消息复制
+### 4.6 消息复制：follower 主动拉取（pull）
 
-`replicateToFollowers(topic, partition, message, offset)`：
+**复制不由 leader 推送，而是 follower 主动拉**（与真实 Kafka 一致）。
+broker 内部有一个 `replica-fetcher-<id>` 线程（`startReplicaFetcher()`），循环做：
 
-- 对分区的每个 follower **提交一个异步任务**（`executor.submit`），互不阻塞；
-- 报文 `REPLICATE(0x21)` 字段：`type(1) + topicLen(2) + topic(N) + partition(4) + offset(8) + msgLen(4) + msg(M)`
-  —— 容量必须是 `19 + topic.length() + message.length`（历史上一处 17 的笔误让复制彻底失效，见第 5 节）；
-- follower 侧 `handleReplicateRequest()` → `partition.appendAtOffset(leaderOffset, message)`：
-  - `offset < 本地LEO` → **幂等忽略**（重复投递不会写重）；
-  - `offset > 本地LEO` → 记录 `Replication gap` 警告后跳到 leader 的 offset（没有日志追赶，见限制）；
-  - 写入后回 `REPLICATE_ACK`。
+```
+遍历「我是 follower」的分区 → 按 leader 分组（每个 leader 复用一条长连接）
+  → 对每个分区发一次 REPLICA_FETCH(0x26)：topic + partition + 我的 LEO + maxBytes
+  → leader 回 REPLICA_FETCH_RESPONSE(0x27)：logStart + leader 的 LEO + 一批记录
+  → 按 leader 的 offset 逐条 partition.appendAtOffset(offset, record)
+```
 
-**副本一致性的验证方式**：比较各副本 `*.log` 的**总字节数**是否完全相同。
-实测：`{broker1: 1200600, broker2: 1200600}`，逐字节对齐。
+关键设计点：
+
+| 机制 | 作用 |
+| --- | --- |
+| **按 LEO 拉取** | follower 每次都问「从我的 LEO 开始有什么」，所以**重启/落后后能自动追赶**（第一阶段用 push 时做不到） |
+| **长轮询** | follower 已追平时 leader 侧不立即返回空，而是最多等 200ms（`REPLICA_FETCH_MAX_WAIT_MS`）：空轮询频率降到 ~5 次/秒，新数据到达却能立即返回 |
+| **长连接复用** | 每个 leader 只用一条连接，连接数从「每条消息一个」降到「每个 leader 一个」 |
+| **logStart 对齐** | leader 回自己的 `logStartOffset`；若 follower 的 LEO 小于它（说明老数据已被保留策略删掉），follower 先 `truncateBefore(leaderLogStart)` 把自己的起点对齐，再开始拉 |
+| **幂等落盘** | `appendAtOffset` 对 `offset < 本地LEO` 直接忽略，重复拉取不会写重 |
+| **故障重连** | 连接异常就丢掉，下一轮重连；同一个 leader 的故障只打一条 WARNING，不刷屏 |
+
+**验证方式**：比较各副本 `*.log` 的**总字节数**是否完全相同。
+实测：杀掉 follower → 继续写入 20 条（leader 不受影响）→ 重启 follower →
+**2 秒内字节数追平**，日志出现 `Replica fetch t-0 appended 20 record(s), LEO now 25 (leader LEO 25)`。
+
 
 ### 4.7 消费消息：是不是任意 Broker 都能消费
 
@@ -457,6 +471,30 @@ flowchart TD
 **实测（线上崩溃模拟）**：停机后往最后一段尾部写 34 字节垃圾 → 重启 → 文件自动回到 160097 字节原长度，
 121 条消息与 offset 完全不变，新消息从 121 继续。
 
+### 4.11 保留策略：老数据怎么被删掉
+
+对应 Kafka 的 `log.retention.*`，实现在 `Partition.cleanup()`：
+
+| 规则 | 说明 |
+| --- | --- |
+| **按大小** | 分区日志总字节超过 `RETENTION_BYTES`（默认 8MB，`-Dsimplekafka.retention.bytes` 可改）时，从**最旧的段**开始删，直到回到上限附近 |
+| **按时间** | 段的文件最后修改时间超过 `RETENTION_MS`（默认 1 小时，`-Dsimplekafka.retention.ms` 可改）就删 |
+| **绝不删活跃段** | 正在写入的段永远保留；也绝不会把分区删成零个段 |
+| **整段删除** | 只删完整的段（`.log` + `.index` 一起删），不做段内截断 |
+| **起点前移** | 删完更新 `logStartOffset` = 剩余最早段的 baseOffset |
+
+触发时机：**保活线程每 5 秒**对每个分区调一次 `cleanup()`（时间维度必须有定时触发；
+大小维度在写入滚动新段时也会顺带检查）。
+
+**删掉的数据必须「明说」，不能糊弄**：消费者再读已被删除的 offset 会收到
+`OffsetOutOfRange: offset N is before log start offset M of topic-partition`
+（`handleFetchRequest` 在读取前检查），而**不是**把幸存的新数据错位标注成它请求的 offset。
+follower 侧则通过 `truncateBefore(leaderLogStart)` 把自己的起点对齐到 leader。
+
+**实测**：40 条 2KB 消息（82KB）在保留上限 64KB 下 → 保活线程删掉 2 个段（6 → 4，82KB → 53KB）；
+`fetch(0)` 返回 `OffsetOutOfRange ... log start offset 14`；从 14 开始读内容正确；
+follower 的段列表与 leader **完全一致**（说明起点对齐也生效）。
+
 ---
 
 ## 5. 边缘问题：现象 → 原因 → 处理
@@ -549,6 +587,19 @@ flowchart TD
 - **实测**：修复后重启集群，分配 `[(0,1,[2]),(1,2,[3]),(2,3,[1])]` 完全不变；
   重启后继续生产仍然复制到 follower（两边 `.log` 字节数一致）。
 
+### 5.15 拉取报 `OffsetOutOfRange`（这是特性，不是 bug）
+- **现象**：消费者拉一个较旧的 offset 时报 `OffsetOutOfRange: offset 0 is before log start offset 14`。
+- **原因**：那部分数据已被**保留策略**删除（见 [4.11](#411-保留策略老数据怎么被删掉)）。
+- **处理**：从报错里的 `log start offset` 重新开始读（控制台消费面板点「从最新开始」或直接填该 offset）。
+  这是**有意为之**：宁可明确报错，也绝不把新数据错位标注成旧 offset 返回给消费者。
+
+### 5.16 follower 掉线重启后没自动补数据
+- **现象**：某副本掉线很久（超过缺席宽限期）后重启，它的数据一直是旧的。
+- **原因**：controller 已经把「确认下线」的它从副本列表里**替换**成别的存活 broker（见 4.8），
+  它回来时已不是这个分区的副本，自然不会去拉数据。
+- **处理**：掉线在宽限期（15 秒）内回来 → 角色保留，pull 复制会在 1~2 秒内自动追平（已实测）；
+  掉线更久 → 需要重新分配（把 `/topics/<t>/partitions/<p>` 改回包含它的分配，或重建 topic）。
+
 ---
 
 ## 6. 线协议：实现、差异与优化
@@ -582,11 +633,12 @@ flowchart TD
 | `METADATA_RESPONSE` | `0x13` | broker → client | `brokerCount(4)` + 每 broker`[id(4)+hostLen(2)+host+port(4)]`；再 `topicCount(4)` + 每 topic`[len(2)+topic+分区数(4)` + 每分区`id(4)+leader(4)+followerCount(4)+followerId(4×N)]` |
 | `CREATE_TOPIC_RESPONSE` | `0x14` | broker → client | `status(1)` |
 | `ERROR_RESPONSE` | `0x1F` | broker → client | `len(2)+错误文本` |
-| `REPLICATE` | `0x21` | leader → follower | `len(2)+topic+partition(4)+offset(8)+msgLen(4)+msg` |
-| `REPLICATE_ACK` | `0x22` | follower → leader | 只有类型字节 |
 | `TOPIC_NOTIFICATION` | `0x23` | controller → broker | `len(2)+topic`，回 1 字节 ack（0 成功 / 1 失败） |
+| `REPLICA_FETCH` | `0x26` | follower → leader | `len(2)+topic+partition(4)+offset(8)+maxBytes(4)+replicaId(4)` |
+| `REPLICA_FETCH_RESPONSE` | `0x27` | leader → follower | `logStart(8)+leo(8)+count(4)+每条[offset(8)+len(4)+payload]` |
 
-> 报文容量要**逐字段相加**核对：`REPLICATE` 必须是 `19 + topic.length() + msg.length`。
+> 报文容量要**逐字段相加**核对：例如 `REPLICA_FETCH` 必须是 `23 + topic.length()`。
+> 第一阶段用的 push 式 `REPLICATE(0x21)` / `REPLICATE_ACK(0x22)` 已在第二阶段删除（见 6.3 #1~#3）。
 
 ### 6.3 与参考实现的差异
 
@@ -594,19 +646,23 @@ flowchart TD
 只有 **1 处语义差异**（`encodeReplicateRequest` 的缓冲容量）；`decodeFetchResponse` 也逐字节相同。
 未忽略空白时那 115 行差异，**全部是尾随空格**。
 
-真正的差异都在「**如何使用协议**」上，共 9 处：
+真正的差异都在「**如何使用协议**」上：
 
 | # | 位置 | 参考实现 | 本项目 | 为什么改 |
 | --- | --- | --- | --- | --- |
-| 1 | `Protocol.encodeReplicateRequest` | `17 + N + M` | **`19 + N + M`** | 字段实需 `1+2+N+4+8+4+M`，17 **少 2 字节** → `putLong(offset)` 抛 `BufferOverflowException`；且该方法在参考版里是**死代码**（全仓库只有定义、无调用） |
-| 2 | `replicateToFollowers` 内联缓冲 | `17 + N + M` | **`19 + N + M`** | 真正生效的复制路径；且它被 `catch (IOException)` 吞掉 → **参考实现的复制是静默失效的** |
+| 1 | `Protocol.encodeReplicateRequest` | `17 + N + M` | ~~`19 + N + M`~~ **已删除** | 字段实需 `1+2+N+4+8+4+M`，17 **少 2 字节** → `putLong(offset)` 抛 `BufferOverflowException`；且该方法在参考版里是**死代码**（全仓库只有定义、无调用） |
+| 2 | `replicateToFollowers` 内联缓冲 | `17 + N + M` | ~~`19 + N + M`~~ **已删除** | 真正生效的复制路径；且它被 `catch (IOException)` 吞掉 → **参考实现的复制是静默失效的**。第二阶段直接放弃了 push 复制，改用 `REPLICA_FETCH` 拉取 |
 | 3 | `forwardProduceToLeader` | `9 + N + M` | **`11 + N + M`** | 实需 `1+2+N+4+4+M`，9 同样少 2 字节 |
 | 4 | broker `handleClient` 读缓冲 | `ByteBuffer.allocate(1024)` | **`READ_BUFFER_SIZE = 64*1024`** | 1KB 装不下带消息的请求，>1KB 的消息直接解析错乱 |
-| 5 | broker 发响应 | 12 处**单次** `clientChannel.write(response)` | 5 处改为 **`writeFully()` 循环**（返回 0 时 `sleep(1)` 让出 CPU） | 被 accept 的连接是**非阻塞**的，单次 write 可能只写出一部分 → 1MB 的 fetch 响应被截断 |
+| 5 | broker 发响应 | 到处**单次** `clientChannel.write(response)` | 大响应改用 **`writeFully()` 循环**（返回 0 时 `sleep(1)` 让出 CPU） | 被 accept 的连接是**非阻塞**的，单次 write 可能只写出一部分 → 1MB 的 fetch 响应被截断 |
 | 6 | client 收包缓冲 | `DEFAULT_BUFFER_SIZE = 4096` | **`64 * 1024`** | 元数据响应随节点/topic 数线性增长，4KB 会截断 |
 | 7 | client fetch 收包策略 | 单次 `channel.read()` + `decodeFetchResponse` | **按协议长度精确读取** `readFully()`：1B type → 4B count → 每条 12B 头 + payload，并识别 `ERROR_RESPONSE` 的 2B 长度 | 彻底摆脱「整个响应必须塞进一个缓冲区」的假设 |
 | 8 | 连接/读超时 | **无任何超时** | `CONNECT_TIMEOUT_MS=3000` / `READ_TIMEOUT_MS=5000` | 参考实现里对端挂了会永久阻塞调用方 |
 | 9 | follower 落盘 | `targetPartition.append(message)` → **follower 自己分配 offset** | `appendAtOffset(leaderOffset, message)` | 参考实现的副本 offset 取决于各自的 LEO，重复投递/并发复制时会错位 |
+| 10 | 复制方向 | leader 每写一条 **push** 给 follower | follower 按 LEO **pull**（`REPLICA_FETCH` + 长轮询 + 长连接） | push 无法追赶：follower 重启/落后就永远补不回来；pull 天然支持追赶，连接数也从「每条消息一个」降到「每个 leader 一个」 |
+| 11 | 副本分配 | `zkClient.getChildren("/brokers")` 直接用，**不排序** | `Collections.sort(brokerIds)` | ZooKeeper **不保证 getChildren 顺序**，不排序会让同样参数每次创建出不同的 leader 分配（不可复现，也与本文档描述不符） |
+| 12 | 保留策略 | **没有**，段只增不删 | `Partition.cleanup()` 按大小/时间整段删除 | 磁盘不能无限增长；配套引入 `logStartOffset` 与 `OffsetOutOfRange`，避免删完后错位返回 |
+| 13 | 日志噪声 | 周期性日志无条件打 INFO | 只在**真的发生变化**时打（topic 变化 / 重分配 / 删段 / 追赶） | 实测空闲日志从 3.2 条/秒降到 **0.2 条/秒** |
 
 > 兼容性：因为**报文字节布局逐字节一致**，新旧客户端/服务端可以互通；
 > 协议简单到能用任意语言手写实现 —— 本次验证中就只用 Python 原生 socket 发了 `0x03`（METADATA）、
@@ -616,24 +672,31 @@ flowchart TD
 
 | 代码位置 | 修掉的问题 | 实测收益 |
 | --- | --- | --- |
-| `SimpleKafkaBroker.replicateToFollowers`、`Protocol.encodeReplicateRequest`（17→19） | 复制**完全发不出去**，而且没有任何日志 | 从「完全失效」→ 副本 `.log` 逐字节相同（实测 `1200600 == 1200600`），日志出现 `Replication to follower 2 succeeded` |
+| 复制换成 `REPLICA_FETCH` pull（#10） | push 复制下 follower 掉线就永远补不回来 | 杀掉 follower、写入 20 条、重启 → **2 秒内字节数追平**；日志：`Replica fetch t-0 appended 20 record(s), LEO now 25 (leader LEO 25)` |
+| `Partition.cleanup()` + `logStartOffset`（#12） | 磁盘无限增长；且删段后会把新数据错位当成旧 offset 返回 | 82KB/上限 64KB → 删掉 2 段（6→4 段，82KB→53KB）；`fetch(0)` 明确报 `OffsetOutOfRange ... log start offset 14` |
+| 长轮询 + 长连接（#10） | 空轮询刷日志、每轮建连 | 空闲日志 3.2 条/秒 → **0.2 条/秒**；连接数从「每轮每 leader 一条」降到「每 leader 一条」 |
+| `Collections.sort(brokerIds)`（#11） | 同样参数每次分配不同、不可复现 | 分配稳定为 `[(0,1,[2]),(1,2,[3]),(2,3,[1])]` |
 | `SimpleKafkaClient.readFetchResponse` + `readFully`（#7） | 大批量拉取报 `BufferUnderflowException` | 120×10KB 分 2 页全部取回，offset 与内容一一对应 |
 | broker `writeFully` + `handleFetchRequest`（#5） | 大响应被截断 | 1MB 级响应完整送达 |
 | `READ_BUFFER_SIZE` 1KB → 64KB（#4） | >1KB 的消息收不全 | 10KB 消息可正常生产与复制 |
 | 超时 + 可增长线程池（#8） | 死节点永久挂住、线程池被耗尽 | 单个卡住的连接不再让 broker「假死」 |
 | `appendAtOffset`（#9） | 副本 offset 漂移 | 「副本字节数一致」可以直接当作校验手段 |
+| 上一阶段的 17→19 / 9→11 容量修正（#1~#3） | 复制完全发不出去、转发抛 `BufferOverflowException`，且无任何日志 | 从「失败无声」→ 报错可见；第二阶段 push 整体被 pull 取代 |
 
 一句话总结优化方向：**容量按字段逐项相加（不靠猜）、收包按长度精确读（不靠缓冲区够大）、发包循环写到底（不靠单次 write）、
-一切可能阻塞的地方都给超时**。
+一切可能阻塞的地方都给超时、改推送为拉取（不靠「实时」）**。
 
 ### 6.5 链路层已知限制
 
 1. **请求侧没有长度分帧**：broker 假设「一次 `read` = 一条完整请求」，因此单条消息天花板 ≈ 64KB − 头部；
    TCP 极端分包时会解析错乱。彻底修复需要 `[4B 帧长][报文]` 或「攒够再解析」的状态机。
-2. **客户端每请求新建连接**（4 处 `SocketChannel.open()`），无连接池/多路复用。
-3. **节流 sleep 继承自参考实现**：accept 循环 `sleep(100ms)`（新建连接 ≤ 10/s）、
-   `handleClient` 每轮 `sleep(50ms)`（同一连接后续请求有 50ms 台阶）—— 这是当前吞吐/延迟的主要天花板。
+2. **客户端每请求新建连接**（4 处 `SocketChannel.open()`），无连接池/多路复用
+   （唯一例外：follower 的副本拉取已复用长连接）。
+3. **节流 sleep**：accept 循环与 `handleClient` 已从继承来的 100ms/50ms 降到 **1ms**
+   （原来是新建连接 ≤ 10/s、同连接后续请求 50ms 台阶的主要瓶颈）。
 4. **无批量化（batch）、无压缩、无 TLS/SASL，消息无 key / 无 CRC**。
+5. **副本拉取用普通 Socket + 一次性序列**：一个 leader 上的多个分区在同一条连接上依次拉，
+   若某分区很大，会推迟同 connection 上后续分区的进度（真实 Kafka 用异步流水线）。
 
 ---
 
@@ -641,12 +704,16 @@ flowchart TD
 
 | 位置 | 常量 | 值 | 含义 |
 | --- | --- | --- | --- |
-| `Partition` | `MAX_SEGMENT_BYTES` | 1 MB | 单段上限，超过则滚动新段 |
+| `Partition` | `MAX_SEGMENT_BYTES` | 1 MB（`-Dsimplekafka.segment.bytes`） | 单段上限，超过则滚动新段 |
+| `Partition` | `RETENTION_BYTES` | 8 MB（`-Dsimplekafka.retention.bytes`） | 分区保留上限，超过则从最旧段开始删；≤0 不限 |
+| `Partition` | `RETENTION_MS` | 1 小时（`-Dsimplekafka.retention.ms`） | 段保留时长；≤0 不限 |
 | `Partition` | `INDEX_INTERVAL_BYTES` | 4096 | 每写满 4KB 追加一条稀疏索引 |
 | `Partition` | `INDEX_ENTRY_BYTES` | 8 | `[4B 相对offset][4B 相对position]` |
 | `Partition` | `MAX_RECORD_BYTES` | 16 MB | 单条记录长度上限（识别脏数据） |
 | `SimpleKafkaBroker` | `READ_BUFFER_SIZE` | 64 KB | 单连接读缓冲 |
 | `SimpleKafkaBroker` | `CONTROL_*_TIMEOUT_MS` | 3000 / 5000 | 控制面转发连接/读超时 |
+| `SimpleKafkaBroker` | `REPLICA_FETCH_*` | 256KB / 100ms / 200ms | 单次拉取上限 / 空闲轮询间隔 / 长轮询最长等待 |
+| `SimpleKafkaBroker` | `BROKER_ABSENCE_GRACE_MS` | 15000 | 判定副本「确认下线」前的缺席宽限期 |
 | `SimpleKafkaBroker` | 线程池 | 8 ~ 200 | 可增长，避免被卡住连接拖垮 |
 | `ZookeeperClient` | `SESSION_TIMEOUT` | 30000 | ZK 会话超时（决定故障感知延迟） |
 | `ZookeeperClient` | `CONNECT_WAIT_TIMEOUT_MS` | 3000 | 连不上 ZK 时快速失败 |
@@ -662,7 +729,7 @@ flowchart TD
 | --- | --- | --- |
 | 1 | 启动三集群 | 4 个进程全绿；ZK 中心出现 `/brokers/1,2,3` 与 `/controller` |
 | 2 | 创建 Topic（3 分区，RF=2） | 三个分区 leader 分别是 1/2/3，follower 轮转 |
-| 3 | 生产者发 1 条到 `partition 0` | 返回 `offset=0`；broker 日志出现 `Replicating t-0 offset=0 to followers=[2]` 与 `Replication to follower 2 succeeded` |
+| 3 | 生产者发 1 条到 `partition 0` | 返回 `offset=0`；约 0.1~0.2 秒后 follower 出现 `Replica fetch t-0 appended 1 record(s), LEO now 1` |
 | 4 | 消费者从 `offset 0` 拉取 | 能读到该条消息；再从 `offset 1` 拉取返回空 |
 | 5 | 连发 120 条 10KB 消息 | 磁盘面板出现两个 `.log`；索引只有几百字节（约 0.08%） |
 | 6 | 消费者分页拉取 | 每次 1MB 以内连续返回，offset 严格递增（跨段不错位） |
@@ -671,6 +738,9 @@ flowchart TD
 | 9 | 「移除」leader 所在 broker | 几秒后 ZK 分配变为「原第一 follower 当 leader，并补入其它存活 broker」；broker 日志出现 `Reassigned ...` |
 | 10 | 停掉集群再启动（已有 topic） | 分配**完全不变**，继续生产仍会复制到 follower（两边 `.log` 字节数一致） |
 | 11 | 用 ZK 中心手工 set `/topics/<t>/partitions/0` 为 `9;1,` | 重启后约 20 秒被自动清理为存活 broker（验证「僵尸副本」会被清理） |
+| 12 | 杀掉某分区的 follower → 继续发 20 条 → 重新「新增 Broker」（同 id/端口） | leader 不受影响；follower 重启后 **1~2 秒自动追平**，两边 `.log` 字节数一致 |
+| 13 | 用 `-Dsimplekafka.retention.bytes=65536 -Dsimplekafka.segment.bytes=16384` 启动 broker，写入超过上限 | 日志出现 `Retention deleted N segment(s) ... log start offset is now X`；拉取老 offset 得到 `OffsetOutOfRange` |
+| 14 | 拿掉 `data/<broker>/<topic>/<partition>/` 下的 `*.index` 后重启 | 索引被自动重建，数据与 offset 不变 |
 
 ---
 
@@ -678,17 +748,24 @@ flowchart TD
 
 **当前明确没有的东西**（不要误以为有）：
 
-- **没有 ISR / 高水位 / leader epoch**：复制是「尽力异步」，写成功不等 follower ack；
-  follower 落后时换成它当 leader 会丢/回退数据。
-- **没有日志追赶与截断**：broker 重新上线后不会补拉缺失区间，只能在下次写入时发现 gap 并前跳。
-- **没有保留策略**：段只增不删，不会按时间/大小清理（清理逻辑需与稀疏索引、段列表一起改）。
+- **没有 ISR / 高水位 / leader epoch**：`logStartOffset`/LEO 已具备，但复制仍是「尽力异步」，
+  写成功不等 follower ack，也没有「已提交」这个概念，消费者可能读到尚未复制完的数据。
+- **掉线超过宽限期的副本不会自动回归**：controller 会把「确认下线」的副本换成别的存活 broker，
+  它回来后不再是副本，也就不会补数据（宽限期内回来则 pull 复制会自动追平）。
 - **没有消费者位点持久化**：`offset` 只存在消费者进程/页面内存里，重启后需要自己指定起点。
-- **每条消息一次 `force(true)`**：为保证「讲了就一定看得到」，吞吐以可讲解为优先。
+- **每条消息一次 `force(true)`**：为保证「讲了就一定看得到」，吞吐以可讲解为优先（无批量、无页缓存刷盘策略）。
 - **消息无 key / 无 CRC / 无压缩 / 无批量**：记录就是 `[4B 长度][裸字节]`。
+- **无 TLS / SASL、无 ACL**。
 
-**建议的第二阶段顺序**（已在存储层打好基础）：
-①保留策略与日志滚动清理 → ②follower 的 fetch 拉取 + 追赶（替代 push 复制）→
-③高水位与 ISR → ④消费者位点持久化到内部 topic → ⑤批量/零拷贝与索引 mmap。
+**第二阶段（本轮）已完成**：
+
+| 项 | 内容 | 验证 |
+| --- | --- | --- |
+| ① 保留策略与日志清理 | `Partition.cleanup()` 按大小/时间整段删除；`logStartOffset` + `OffsetOutOfRange`；保活线程每 5 秒触发 | 单测 3 组（按字节/按时间/活跃段保护）+ 独立小集群线上验证（6→4 段，起点对齐） |
+| ② follower 拉取式复制 + 追赶 | `REPLICA_FETCH`/`REPLICA_FETCH_RESPONSE`，长轮询 + 长连接 + `truncateBefore` 起点对齐；删除 push 复制 | 连跑 6+ 轮：杀掉 follower → 写入 20 条 → 重启 → 2 秒追平；副本字节数一致 |
+
+**第三阶段计划**：③高水位与 ISR（让「已提交」有意义）→ ④消费者位点持久化到内部 topic →
+⑤批量/零拷贝与索引 mmap。
 
 ---
 
