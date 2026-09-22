@@ -34,7 +34,12 @@
    - 4.9 [持久化：消息怎么落盘](#49-持久化消息怎么落盘)
    - 4.10 [重启后：持久化的数据怎么读回来](#410-重启后持久化的数据怎么读回来)
 5. [边缘问题：现象 → 原因 → 处理](#5-边缘问题现象--原因--处理)
-6. [协议速查](#6-协议速查)
+6. [线协议：实现、差异与优化](#6-线协议实现差异与优化)
+   - 6.1 [三层实现](#61-三层实现)
+   - 6.2 [报文布局速查](#62-报文布局速查)
+   - 6.3 [与参考实现的差异](#63-与参考实现的差异)
+   - 6.4 [优化点与收益](#64-优化点与收益)
+   - 6.5 [链路层已知限制](#65-链路层已知限制)
 7. [常量速查](#7-常量速查)
 8. [10 分钟实操验证清单](#8-10-分钟实操验证清单)
 9. [已知限制与第二阶段计划](#9-已知限制与第二阶段计划)
@@ -546,7 +551,23 @@ flowchart TD
 
 ---
 
-## 6. 协议速查
+## 6. 线协议：实现、差异与优化
+
+### 6.1 三层实现
+
+| 层 | 实现 | 说明 |
+| --- | --- | --- |
+| **报文定义** | `Protocol.java`：纯静态工具类（无状态、不碰网络） | 12 种类型常量 + `encodeXxx` / `decodeXxx`，编解码就是一行行 `putXxx` / `getXxx` |
+| **传输** | 客户端 `SocketChannel.open()`（4 处，**每请求一条短连接**：connect → write → read → close）；broker `ServerSocketChannel`（非阻塞）+ 可增长线程池 | TCP 之上**没有帧层**，直接读写 `ByteBuffer` |
+| **分发** | `SimpleKafkaBroker.processClientMessage()`：读 1 字节 type → `switch` → 对应 handler | handler 内按字段顺序 `buffer.getXxx()` 取值 |
+
+两个容易被忽略的实现细节：
+
+- 客户端有个 `correlationId` 字段，但**只在构造与 getter 里出现过（共 2 次），从未参与请求/响应匹配** ——
+  因为「一条连接只发一个请求」，对应关系靠连接本身保证，不需要关联 ID。
+- 只有 `ERROR_RESPONSE` 带长度前缀（`len(2)+文本`），其余报文靠字段顺序自解析，因此收到未知类型时只能断开连接。
+
+### 6.2 报文布局速查
 
 所有报文都是**大端**、以 1 字节类型开头；`topic` 用 `short` 长度前缀 + UTF-8 字节。
 
@@ -566,6 +587,53 @@ flowchart TD
 | `TOPIC_NOTIFICATION` | `0x23` | controller → broker | `len(2)+topic`，回 1 字节 ack（0 成功 / 1 失败） |
 
 > 报文容量要**逐字段相加**核对：`REPLICATE` 必须是 `19 + topic.length() + msg.length`。
+
+### 6.3 与参考实现的差异
+
+**结论先行：协议格式没有不一致。** 用 `diff -w -B`（忽略空白）比对两份 `Protocol.java`，
+只有 **1 处语义差异**（`encodeReplicateRequest` 的缓冲容量）；`decodeFetchResponse` 也逐字节相同。
+未忽略空白时那 115 行差异，**全部是尾随空格**。
+
+真正的差异都在「**如何使用协议**」上，共 9 处：
+
+| # | 位置 | 参考实现 | 本项目 | 为什么改 |
+| --- | --- | --- | --- | --- |
+| 1 | `Protocol.encodeReplicateRequest` | `17 + N + M` | **`19 + N + M`** | 字段实需 `1+2+N+4+8+4+M`，17 **少 2 字节** → `putLong(offset)` 抛 `BufferOverflowException`；且该方法在参考版里是**死代码**（全仓库只有定义、无调用） |
+| 2 | `replicateToFollowers` 内联缓冲 | `17 + N + M` | **`19 + N + M`** | 真正生效的复制路径；且它被 `catch (IOException)` 吞掉 → **参考实现的复制是静默失效的** |
+| 3 | `forwardProduceToLeader` | `9 + N + M` | **`11 + N + M`** | 实需 `1+2+N+4+4+M`，9 同样少 2 字节 |
+| 4 | broker `handleClient` 读缓冲 | `ByteBuffer.allocate(1024)` | **`READ_BUFFER_SIZE = 64*1024`** | 1KB 装不下带消息的请求，>1KB 的消息直接解析错乱 |
+| 5 | broker 发响应 | 12 处**单次** `clientChannel.write(response)` | 5 处改为 **`writeFully()` 循环**（返回 0 时 `sleep(1)` 让出 CPU） | 被 accept 的连接是**非阻塞**的，单次 write 可能只写出一部分 → 1MB 的 fetch 响应被截断 |
+| 6 | client 收包缓冲 | `DEFAULT_BUFFER_SIZE = 4096` | **`64 * 1024`** | 元数据响应随节点/topic 数线性增长，4KB 会截断 |
+| 7 | client fetch 收包策略 | 单次 `channel.read()` + `decodeFetchResponse` | **按协议长度精确读取** `readFully()`：1B type → 4B count → 每条 12B 头 + payload，并识别 `ERROR_RESPONSE` 的 2B 长度 | 彻底摆脱「整个响应必须塞进一个缓冲区」的假设 |
+| 8 | 连接/读超时 | **无任何超时** | `CONNECT_TIMEOUT_MS=3000` / `READ_TIMEOUT_MS=5000` | 参考实现里对端挂了会永久阻塞调用方 |
+| 9 | follower 落盘 | `targetPartition.append(message)` → **follower 自己分配 offset** | `appendAtOffset(leaderOffset, message)` | 参考实现的副本 offset 取决于各自的 LEO，重复投递/并发复制时会错位 |
+
+> 兼容性：因为**报文字节布局逐字节一致**，新旧客户端/服务端可以互通；
+> 协议简单到能用任意语言手写实现 —— 本次验证中就只用 Python 原生 socket 发了 `0x03`（METADATA）、
+> `0x02`（FETCH）直接与 broker 对话成功。
+
+### 6.4 优化点与收益
+
+| 代码位置 | 修掉的问题 | 实测收益 |
+| --- | --- | --- |
+| `SimpleKafkaBroker.replicateToFollowers`、`Protocol.encodeReplicateRequest`（17→19） | 复制**完全发不出去**，而且没有任何日志 | 从「完全失效」→ 副本 `.log` 逐字节相同（实测 `1200600 == 1200600`），日志出现 `Replication to follower 2 succeeded` |
+| `SimpleKafkaClient.readFetchResponse` + `readFully`（#7） | 大批量拉取报 `BufferUnderflowException` | 120×10KB 分 2 页全部取回，offset 与内容一一对应 |
+| broker `writeFully` + `handleFetchRequest`（#5） | 大响应被截断 | 1MB 级响应完整送达 |
+| `READ_BUFFER_SIZE` 1KB → 64KB（#4） | >1KB 的消息收不全 | 10KB 消息可正常生产与复制 |
+| 超时 + 可增长线程池（#8） | 死节点永久挂住、线程池被耗尽 | 单个卡住的连接不再让 broker「假死」 |
+| `appendAtOffset`（#9） | 副本 offset 漂移 | 「副本字节数一致」可以直接当作校验手段 |
+
+一句话总结优化方向：**容量按字段逐项相加（不靠猜）、收包按长度精确读（不靠缓冲区够大）、发包循环写到底（不靠单次 write）、
+一切可能阻塞的地方都给超时**。
+
+### 6.5 链路层已知限制
+
+1. **请求侧没有长度分帧**：broker 假设「一次 `read` = 一条完整请求」，因此单条消息天花板 ≈ 64KB − 头部；
+   TCP 极端分包时会解析错乱。彻底修复需要 `[4B 帧长][报文]` 或「攒够再解析」的状态机。
+2. **客户端每请求新建连接**（4 处 `SocketChannel.open()`），无连接池/多路复用。
+3. **节流 sleep 继承自参考实现**：accept 循环 `sleep(100ms)`（新建连接 ≤ 10/s）、
+   `handleClient` 每轮 `sleep(50ms)`（同一连接后续请求有 50ms 台阶）—— 这是当前吞吐/延迟的主要天花板。
+4. **无批量化（batch）、无压缩、无 TLS/SASL，消息无 key / 无 CRC**。
 
 ---
 
