@@ -44,7 +44,7 @@
 ## 1. 30 秒跑起来
 
 ```bash
-cd /home/root/build-your-own-kafka
+cd /你的路径/build-your-own-kafka
 
 # 构建（必须带 clean，见第 5 节「构建坑」）
 mvn clean package -DskipTests
