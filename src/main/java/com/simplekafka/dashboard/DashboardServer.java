@@ -322,7 +322,7 @@ public final class DashboardServer {
         // 数据异常时按残留节点处理
       }
     }
-    if (registeredPort > 0 && findBrokerProcess(id, registeredPort) != null) {
+    if (registeredPort > 0 && findBrokerProcess(id, registeredPort, port) != null) {
       return false;
     }
 
@@ -388,7 +388,7 @@ public final class DashboardServer {
 
     // 兜底清扫：仍有存活的集群进程说明没有响应优雅信号，直接强制结束
     int swept = 0;
-    for (BrokerProcess broker : scanBrokerProcesses()) {
+    for (BrokerProcess broker : scanBrokerProcesses(requestedZkPort)) {
       broker.handle.destroyForcibly();
       swept++;
     }
@@ -476,7 +476,7 @@ public final class DashboardServer {
   private void adoptExternalBrokers(int port, Map<Integer, String> registered) {
     adoptZooKeeper(port);
     Map<Integer, List<BrokerProcess>> byId = new LinkedHashMap<>();
-    for (BrokerProcess broker : scanBrokerProcesses()) {
+    for (BrokerProcess broker : scanBrokerProcesses(port)) {
       byId.computeIfAbsent(broker.id, ignored -> new ArrayList<>()).add(broker);
     }
 
@@ -554,8 +554,14 @@ public final class DashboardServer {
     }
   }
 
-  /** 扫描所有 {@code SimpleKafkaBroker <id> <host> <port> <zkPort>} 进程。 */
-  private static List<BrokerProcess> scanBrokerProcesses() {
+  /**
+   * 扫描属于**指定 ZooKeeper 集群**的 {@code SimpleKafkaBroker <id> <host> <port> <zkPort>} 进程。
+   *
+   * <p>必须按 zkPort 限定范围：broker id 只在同一个集群内唯一，不同集群完全可能都有 id=1。
+   * 早期的按 id 匹配机制会认为它们是「同一 id 的重复进程」而强杀其中一个 ——
+   * 实际后果是：在别处跑一套测试集群（同 id、不同端口/ZK）会把主集群的 broker 干掉。
+   */
+  private static List<BrokerProcess> scanBrokerProcesses(int zkPort) {
     List<BrokerProcess> found = new ArrayList<>();
     try (Stream<ProcessHandle> handles = ProcessHandle.allProcesses()) {
       for (ProcessHandle handle : handles.toArray(ProcessHandle[]::new)) {
@@ -567,7 +573,9 @@ public final class DashboardServer {
           if (parts[i].endsWith("SimpleKafkaBroker")) {
             int id = parseIntSafe(parts[i + 1], -1);
             int port = parseIntSafe(parts[i + 3], -1);
-            if (id > 0) found.add(new BrokerProcess(id, port, handle));
+            // 第 4 个参数是 zkPort；省略时与 broker 的默认值 2181 一致
+            int processZkPort = parts.length > i + 4 ? parseIntSafe(parts[i + 4], 2181) : 2181;
+            if (id > 0 && processZkPort == zkPort) found.add(new BrokerProcess(id, port, handle));
             break;
           }
         }
@@ -614,9 +622,12 @@ public final class DashboardServer {
     return -1;
   }
 
-  /** 通过进程命令行匹配 {@code SimpleKafkaBroker <id> ...}，找到对应进程句柄。 */
-  private static ProcessHandle findBrokerProcess(int brokerId, int port) {
-    for (BrokerProcess broker : scanBrokerProcesses()) {
+  /**
+   * 通过进程命令行匹配 {@code SimpleKafkaBroker <id> ...}，找到**本集群**中 id（必要时还有端口）
+   * 对应的进程句柄；不同集群的同 id 进程不会互相干扰。
+   */
+  private static ProcessHandle findBrokerProcess(int brokerId, int port, int zkPort) {
+    for (BrokerProcess broker : scanBrokerProcesses(zkPort)) {
       if (broker.id == brokerId && (port <= 0 || broker.port == port)) {
         return broker.handle;
       }
